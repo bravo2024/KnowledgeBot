@@ -1,91 +1,84 @@
 from __future__ import annotations
-import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent))
-import numpy as np, pandas as pd, streamlit as st, matplotlib.pyplot as plt
-from src.data import make_synthetic, TARGET_NAME
-from src.model import train_all_models, cross_validate
-from src.visualizations import *
-st.set_page_config(page_title="KnowledgeBot | Moveworks Enterprise KB", layout="wide", page_icon="\U0001f4da")
+"""KnowledgeBot — Streamlit dashboard for an enterprise knowledge-base RAG.
+
+The retriever is built in-memory from the synthetic corpus (no external LLM,
+no stale artifacts).  Users can ask questions, inspect the extracted answer
+and its source passage, and review retrieval quality over the labelled eval
+queries.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import pandas as pd
+import streamlit as st
+
+from src.data import make_corpus
+from src.model import build_tfidf_index
+from src.evaluate import evaluate_retriever
+from src.visualizations import (
+    plot_corpus_by_category,
+    plot_recall_at_k,
+    plot_retrieval_scores,
+)
+
+st.set_page_config(page_title="KnowledgeBot | Wipro Enterprise KB RAG", layout="wide", page_icon="📚")
+
+
+@st.cache_resource
+def load_retriever():
+    corpus = make_corpus()
+    return build_tfidf_index(corpus["documents"]), corpus
+
+
+retriever, corpus = load_retriever()
+
 with st.sidebar:
-    st.header("\u2699 Config"); n=st.slider("Samples",2000,20000,10000,1000); tau=st.slider("Threshold",0.05,0.95,0.50,0.05)
-    st.caption("Moveworks | Enterprise Knowledge Bot & RAG")
-data=make_synthetic(n=n); b=train_all_models(data)
-y_test=b["y_test"]; y_probas={n:b["results"][n]["y_proba"] for n in b["results"]}
-best=max(b["results"],key=lambda n: b["results"][n]["metrics"].get("roc_auc",0))
-c1,c2,c3,c4=st.columns(4)
-c1.metric("Queries",f"{n:,}"); c2.metric("Helpful Rate",f"{data['positive_rate']:.1%}")
-c3.metric("Best AUC",f"{b['results'][best]['metrics']['roc_auc']:.4f}"); c4.metric("Best",best)
-t1,t2,t3,t4=st.tabs(["\U0001f4ca Explorer","\U0001f52c Model Lab","\U0001f50d Retrieval Analytics","\U0001f4a1 Performance"])
-with t1:
-    st.dataframe(data["df"].head(50),use_container_width=True,height=200)
-    fig,ax=plt.subplots(figsize=(5,3)); _style()
-    ax.bar(["Not Helpful","Helpful"],[1-data["positive_rate"],data["positive_rate"]],color=["#f43f5e","#22c55e"])
-    for i,v in enumerate([1-data["positive_rate"],data["positive_rate"]]): ax.text(i,v+.01,f"{v:.1%}",ha="center",color="white")
-    ax.set_title("Answer Helpfulness Distribution",color="white"); ax.grid(True,alpha=.2)
-    st.pyplot(fig)
-with t2:
-    rows=[{**{"Model":n},**{k:f"{v:.4f}" for k,v in r["metrics"].items() if k!="confusion_matrix"}} for n,r in b["results"].items()]
-    st.dataframe(pd.DataFrame(rows).set_index("Model"),use_container_width=True)
-    col_a,col_b=st.columns(2)
-    with col_a: st.pyplot(plot_roc_curve(y_test,y_probas))
-    with col_b: st.pyplot(plot_calibration_curve(y_test,y_probas))
-    st.pyplot(plot_confusion_matrix(y_test,b["results"]["XGBoost"]["y_pred"],"XGBoost"))
-    cv=cross_validate(data); cvr=[{"Model":n,"AUC":f"{s['roc_auc']['mean']:.4f}","\u00b1":f"\u00b1{s['roc_auc']['std']:.4f}"} for n,s in cv.items()]
-    st.dataframe(pd.DataFrame(cvr).set_index("Model"),use_container_width=True)
-with t3:
-    st.subheader("RAG Pipeline Stage Performance")
-    st.latex(r"\text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V")
-    st.caption("Scaled dot-product attention: core of transformer retrieval. Query-document affinity scored via pairwise similarity in embedding space.")
-    st.latex(r"s(q,d) = \text{Transformer}([q; d]) \quad (\text{cross-encoder scores relevancy jointly})")
-    st.caption("Cross-encoder: query and document fed together → single relevance score. More accurate than bi-encoder but requires O(n) forward passes per query.")
-    st.latex(r"\text{MRR} = \frac{1}{|Q|}\sum_{q\in Q} \frac{1}{\text{rank}_q}")
-    st.caption("Mean Reciprocal Rank: evaluates how early the first relevant result appears. Standard for question-answering and factoid retrieval tasks.")
-    st.latex(r"\text{DCG} = \sum_{i=1}^p \frac{2^{\text{rel}_i} - 1}{\log_2(i+1)}, \quad \text{NDCG} = \frac{\text{DCG}}{\text{IDCG}}")
-    st.caption("Normalized Discounted Cumulative Gain: graded relevance metric penalizing relevant documents ranked lower. IDCG normalizes per query.")
-    st.caption("Moveworks' enterprise Copilot uses a multi-stage RAG pipeline: bi-encoder retrieval (coarse candidate selection via cosine similarity on BERT embeddings) → cross-encoder reranking (fine-grained relevance scoring) → LLM synthesis (GPT-4/Claude). The pipeline supports 500+ enterprise SaaS connectors (Salesforce, Jira, Confluence, ServiceNow) with sub-2s response time.")
-    st.latex(r"\text{Retrieval Score} = \text{EmbeddingSim} \times \text{RerankerScore}")
-    col_a,col_b=st.columns(2)
-    with col_a:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        helpful=data["df"][data["df"]["answer_helpful"]==1]["embedding_cosine_sim"]
-        not_helpful=data["df"][data["df"]["answer_helpful"]==0]["embedding_cosine_sim"]
-        ax.hist(helpful,bins=30,alpha=0.5,color="#22c55e",label="Helpful",density=True)
-        ax.hist(not_helpful,bins=30,alpha=0.5,color="#f43f5e",label="Not Helpful",density=True)
-        ax.set_title("Embedding Cosine Similarity",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    with col_b:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        helpful=data["df"][data["df"]["answer_helpful"]==1]["reranker_score"]
-        not_helpful=data["df"][data["df"]["answer_helpful"]==0]["reranker_score"]
-        ax.hist(helpful,bins=30,alpha=0.5,color="#22c55e",label="Helpful",density=True)
-        ax.hist(not_helpful,bins=30,alpha=0.5,color="#f43f5e",label="Not Helpful",density=True)
-        ax.set_title("Reranker Score",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    kg_help=data["df"].groupby("knowledge_graph_depth")[TARGET_NAME].mean()
-    fig,ax=plt.subplots(figsize=(5,3)); _style()
-    ax.bar(range(1,6),kg_help.values,color=["#22c55e","#fbbf24","#f97316","#22d3ee","#a78bfa"])
-    ax.set_xticks(range(1,6)); ax.set_xticklabels([f"Level {i}" for i in range(1,6)]); ax.set_title("Helpfulness by KG Depth",color="white"); ax.grid(True,alpha=.2)
-    st.pyplot(fig)
-with t4:
-    st.subheader("System Performance Metrics")
-    st.latex(r"\text{Precision@K} = \frac{\text{Relevant}}{\text{Top-K}}")
-    col_a,col_b=st.columns(2)
-    with col_a:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        helpful=data["df"][data["df"]["answer_helpful"]==1]["passage_retrieval_score"]
-        not_helpful=data["df"][data["df"]["answer_helpful"]==0]["passage_retrieval_score"]
-        ax.hist(helpful,bins=30,alpha=0.5,color="#22c55e",label="Helpful",density=True)
-        ax.hist(not_helpful,bins=30,alpha=0.5,color="#f43f5e",label="Not Helpful",density=True)
-        ax.set_title("Passage Retrieval Score",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    with col_b:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        helpful=data["df"][data["df"]["answer_helpful"]==1]["answer_confidence"]
-        not_helpful=data["df"][data["df"]["answer_helpful"]==0]["answer_confidence"]
-        ax.hist(helpful,bins=30,alpha=0.5,color="#22c55e",label="Helpful",density=True)
-        ax.hist(not_helpful,bins=30,alpha=0.5,color="#f43f5e",label="Not Helpful",density=True)
-        ax.set_title("Answer Confidence",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    c1,c2,c3=st.columns(3)
-    c1.metric("Avg Cosine Similarity",f"{data['df']['embedding_cosine_sim'].mean():.3f}")
-    c2.metric("Avg Retrieval Score",f"{data['df']['passage_retrieval_score'].mean():.3f}")
-    c3.metric("Avg Confidence",f"{data['df']['answer_confidence'].mean():.3f}")
+    st.header("⚙ Knowledge base")
+    st.metric("Documents", corpus["n_documents"])
+    st.metric("Eval queries", corpus["n_queries"])
+    st.caption("Wipro · Enterprise knowledge-base RAG — TF-IDF retrieval + extractive generation")
+    st.pyplot(plot_corpus_by_category(corpus["documents"]))
+
+st.title("📚 KnowledgeBot — Enterprise Knowledge RAG")
+st.caption(
+    "Ask a question and receive a grounded, extractive answer drawn from an "
+    "internal policy / FAQ knowledge base. Ranking uses cosine similarity over "
+    "an L2-normalised TF-IDF index."
+)
+
+tab_q, tab_eval, tab_browse = st.tabs(["🔍 Ask a question", "📊 Retrieval evaluation", "🗂 Browse corpus"])
+
+with tab_q:
+    query = st.text_input("Ask a question", value="What is the password policy?")
+    k = st.slider("Top-k passages", 1, 10, 5)
+    if query.strip():
+        results = retriever.retrieve(query, k=k)
+        ans = retriever.extractive_answer(query, k=k)
+        st.subheader("Extractive answer")
+        st.success(ans["answer"])
+        st.caption(f"Source: {ans['source_doc_id']} — {ans['source_title']}  (score {ans['score']:.3f})")
+        st.pyplot(plot_retrieval_scores(results))
+        with st.expander("Retrieved passages"):
+            for r in results:
+                st.markdown(f"**{r['doc_id']} · {r['title']}** ({r['category']}) — `{r['score']:.3f}`")
+                st.write(r["content"])
+
+with tab_eval:
+    metrics = evaluate_retriever(retriever, corpus["queries"], k_values=(1, 3, 5))
+    agg = metrics["aggregate"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Recall@5", f"{agg['recall@5']:.3f}")
+    c2.metric("MRR", f"{agg['mrr']:.3f}")
+    c3.metric("Precision@5", f"{agg['precision@5']:.3f}")
+    c4.metric("Faithfulness", f"{agg['faithfulness']:.3f}")
+    st.pyplot(plot_recall_at_k(metrics))
+    cols = ["query_id", "query", "top_doc_id", "mrr", "recall@1", "recall@5", "faithfulness"]
+    st.dataframe(pd.DataFrame(metrics["per_query"])[cols], use_container_width=True)
+
+with tab_browse:
+    df = pd.DataFrame(corpus["documents"])
+    cat = st.selectbox("Filter by category", ["All"] + corpus["categories"])
+    view = df if cat == "All" else df[df["category"] == cat]
+    st.dataframe(view[["id", "title", "category", "content"]], use_container_width=True)

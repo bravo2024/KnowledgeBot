@@ -1,129 +1,114 @@
 from __future__ import annotations
+"""TF-IDF retriever and extractive answer generator for KnowledgeBot.
+
+The retriever builds a sparse TF-IDF document matrix (sublinear TF, L2
+normalised) and ranks passages by cosine similarity to the query (computed
+efficiently as a linear kernel over the normalised vectors).  Generation is
+*extractive*: the answer is the single sentence from the top passage that
+shares the most query terms, which keeps the system fully offline (no
+external LLM calls).
+"""
+import re
+from typing import Any
+
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    "a an the and or of to in on for is are was were be been being with as at by "
+    "this that these those it its from your you we our they their i how do what "
+    "when where which why can should".split()
+)
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
-    )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
-    return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
-    }
+def _tokenize(text: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall(text.lower()) if len(t) >= 2 and t not in _STOPWORDS]
 
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
+def _sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+class TfidfRetriever:
+    """Sparse TF-IDF retriever with cosine-similarity ranking."""
+
+    def __init__(self, ngram_range: tuple[int, int] = (1, 2), min_df: int = 1) -> None:
+        self.ngram_range = ngram_range
+        self.min_df = min_df
+        self.vectorizer: TfidfVectorizer | None = None
+        self.doc_matrix = None
+        self.documents: list[dict[str, Any]] = []
+        self.id_to_idx: dict[str, int] = {}
+
+    def fit(self, documents: list[dict[str, Any]]) -> "TfidfRetriever":
+        self.documents = list(documents)
+        self.id_to_idx = {d["id"]: i for i, d in enumerate(self.documents)}
+        contents = [f"{d.get('title', '')}. {d.get('content', '')}" for d in self.documents]
+        self.vectorizer = TfidfVectorizer(
+            tokenizer=_tokenize,
+            token_pattern=None,
+            ngram_range=self.ngram_range,
+            min_df=self.min_df,
+            sublinear_tf=True,
+            norm="l2",
+        )
+        self.doc_matrix = self.vectorizer.fit_transform(contents)
+        return self
+
+    def retrieve(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+        if self.vectorizer is None or self.doc_matrix is None:
+            raise RuntimeError("Retriever has not been fitted; call fit() first.")
+        qv = self.vectorizer.transform([query])
+        scores = linear_kernel(qv, self.doc_matrix).ravel()
+        k = min(k, len(self.documents))
+        top_idx = np.argsort(scores)[::-1][:k]
+        results: list[dict[str, Any]] = []
+        for i in top_idx:
+            d = self.documents[i]
+            results.append({
+                "doc_id": d["id"],
+                "title": d.get("title", ""),
+                "category": d.get("category", ""),
+                "score": float(scores[i]),
+                "content": d.get("content", ""),
+            })
+        return results
+
+    def extractive_answer(self, query: str, k: int = 3) -> dict[str, Any]:
+        hits = self.retrieve(query, k=k)
+        if not hits:
+            return {"answer": "", "source_doc_id": None, "source_title": "",
+                    "score": 0.0, "context": "", "retrieved": []}
+        top = hits[0]
+        q_tokens = set(_tokenize(query))
+        sentences = _sentences(top["content"])
+        if sentences and q_tokens:
+            answer = max(sentences, key=lambda s: len(q_tokens & set(_tokenize(s))))
+        elif sentences:
+            answer = sentences[0]
         else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+            answer = top["content"]
+        return {
+            "answer": answer,
+            "source_doc_id": top["doc_id"],
+            "source_title": top["title"],
+            "score": top["score"],
+            "context": top["content"],
+            "retrieved": hits,
+        }
 
 
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
+def build_tfidf_index(documents: list[dict[str, Any]]) -> TfidfRetriever:
+    """Convenience wrapper: fit and return a TfidfRetriever."""
+    return TfidfRetriever().fit(documents)
 
 
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+def retrieve(index: TfidfRetriever, query: str, k: int = 5) -> list[dict[str, Any]]:
+    return index.retrieve(query, k)
+
+
+def extractive_answer(index: TfidfRetriever, query: str, k: int = 3) -> dict[str, Any]:
+    return index.extractive_answer(query, k)
